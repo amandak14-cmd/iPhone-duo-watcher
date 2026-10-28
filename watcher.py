@@ -40,13 +40,6 @@ WATCH = {
     "iPhone Duo 512GB Night Sky": "https://www.apple.com/sg/shop/buy-iphone/iphone-duo/7.6-inch-display-512gb-night-sky",
 }
 
-# Words used to spot each config inside Apple's page data.
-COLOUR_PATTERNS = {
-    "iPhone Duo 512GB Star White": r"star[\s\-_]?white",
-    "iPhone Duo 512GB Night Sky": r"night[\s\-_]?sky",
-}
-CAPACITY_PATTERN = r"512\s?gb"
-
 FULFILMENT_URL = "https://www.apple.com/sg/shop/fulfillment-messages"
 SEARCH_POSTCODE = "018972"  # Marina Bay Sands; "search nearby" from here covers the whole island
 MAX_STORE_DISTANCE_KM = 60  # anything farther isn't in Singapore
@@ -62,6 +55,13 @@ HEADERS = {
 }
 
 ERROR_ALERT_AFTER = 5  # consecutive failed checks before we bother you about it
+
+# Part numbers read from Apple SG's iPhone Duo page on 28 Oct 2026.
+# Used if auto-detection from the product page doesn't work.
+KNOWN_PARTS = {
+    "iPhone Duo 512GB Star White": "MK2F4X/A",
+    "iPhone Duo 512GB Night Sky": "MK2G4X/A",
+}
 
 
 # --------------------------------------------------------------- helpers ---
@@ -141,38 +141,23 @@ def print_chat_ids(token):
 
 # ---------------------------------------------------------- part numbers ---
 
-PART_RE = re.compile(r'"partNumber"\s*:\s*"([A-Z0-9]{4,8}[A-Z]{2}/A)"')
-ANY_PART_RE = re.compile(r"\b([A-Z0-9]{5}[A-Z]{2}/A)\b")
+# Singapore part numbers look like MK2F4X/A (one or two region letters before /A).
+PART_RE = re.compile(r'"partNumber"\s*:\s*"([A-Z0-9]{5}[A-Z]{1,2}/A)"')
 
 
-def _nearest(text, pattern, pos, window):
-    lo, hi = max(0, pos - window), min(len(text), pos + window)
-    best = None
-    for m in re.finditer(pattern, text[lo:hi], re.I):
-        d = abs((lo + m.start()) - pos)
-        best = d if best is None or d < best else best
-    return best
-
-
-def resolve_part(label, url, verbose=False):
-    """Find the Apple part number for one configuration from its product page."""
+def page_products(url):
+    """Reads Apple's product page and returns {(colour, capacity): part_number}."""
     html = http_get(url)
-    colour = COLOUR_PATTERNS[label]
-    scored = []
-    for m in PART_RE.finditer(html):
-        dc = _nearest(html, colour, m.start(), 1500)
-        dk = _nearest(html, CAPACITY_PATTERN, m.start(), 1500)
-        if verbose:
-            log(f"  candidate {m.group(1)}  colour-dist={dc}  capacity-dist={dk}")
-        if dc is not None and dk is not None:
-            scored.append((dc + dk, m.group(1)))
-    if scored:
-        scored.sort()
-        return scored[0][1]
-    if verbose:
-        loose = sorted(set(ANY_PART_RE.findall(html)))
-        log(f"  no structured match; loose part-like strings on page: {loose[:20]}")
-    return None
+    found = {}
+    starts = [m for m in PART_RE.finditer(html)]
+    for i, m in enumerate(starts):
+        end = starts[i + 1].start() if i + 1 < len(starts) else len(html)
+        chunk = html[m.end():end]
+        cap = re.search(r'"dimensionCapacity"\s*:\s*"(\w+)"', chunk)
+        col = re.search(r'"dimensionColor"\s*:\s*"(\w+)"', chunk)
+        if cap and col:
+            found[(col.group(1).lower(), cap.group(1).lower())] = m.group(1)
+    return found
 
 
 def get_parts(state, verbose=False):
@@ -181,24 +166,18 @@ def get_parts(state, verbose=False):
         parts = [p.strip() for p in manual.split(",") if p.strip()]
         return {f"Part {p}": p for p in parts}
 
-    cached = state.get("parts") or {}
-    parts = {}
-    for label, url in WATCH.items():
-        if label in cached and not verbose:
-            parts[label] = cached[label]
-            continue
+    if verbose:
+        # Double-check the built-in part numbers against Apple's live page.
         try:
-            pn = resolve_part(label, url, verbose=verbose)
+            live = page_products(next(iter(WATCH.values())))
+            for (col, cap), pn in sorted(live.items()):
+                log(f"  Apple page lists {pn}  {col} {cap}")
+            for label, pn in KNOWN_PARTS.items():
+                ok = pn in live.values()
+                log(f"{label} -> {pn}  {'(matches Apple page)' if ok else '(NOT on Apple page — tell Claude)'}")
         except Exception as e:  # noqa: BLE001
-            log(f"Couldn't load {url}: {e}")
-            pn = None
-        if pn:
-            parts[label] = pn
-            log(f"{label} -> {pn}")
-        else:
-            log(f"Couldn't work out the part number for {label}.")
-    state["parts"] = parts
-    return parts
+            log(f"Couldn't read Apple's product page to double-check part numbers: {e}")
+    return dict(KNOWN_PARTS)
 
 
 # ----------------------------------------------------------- availability ---
@@ -227,7 +206,16 @@ def check_availability(parts):
     for i, label in enumerate(labels):
         params[f"parts.{i}"] = parts[label]
 
-    data = json.loads(http_get(FULFILMENT_URL, params))
+    try:
+        raw = http_get(FULFILMENT_URL, params)
+    except urllib.error.HTTPError as e:
+        if e.code == 541:
+            raise RuntimeError("Apple refused the stock check (HTTP 541, Apple's automated-traffic block)") from None
+        raise RuntimeError(f"Apple returned HTTP {e.code}") from None
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        raise RuntimeError("Apple sent back a web page instead of stock data") from None
     stores = (((data.get("body") or {}).get("content") or {}).get("pickupMessage") or {}).get("stores")
     if stores is None:
         raise RuntimeError(f"Unexpected response shape: {str(data)[:300]}")
@@ -337,11 +325,14 @@ def main():
 
     if mode == "discover":
         parts = get_parts(state, verbose=True)
-        log("Resolved:", parts)
-        if parts:
-            for (store, label), (ok, quote) in sorted(check_availability(parts).items()):
-                log(f"{store:<24} {label:<30} {quote}")
-        save_state(state_file, state)
+        try:
+            avail = check_availability(parts)
+            log("Stock check worked. Current status:")
+            for (store, label), (ok, quote) in sorted(avail.items()):
+                log(f"  {'🟢' if ok else '⚪'} {store:<24} {label:<30} {quote}")
+        except Exception as e:  # noqa: BLE001
+            log(f"STOCK CHECK FAILED: {e}")
+            sys.exit(1)
         return
 
     parts = get_parts(state)
