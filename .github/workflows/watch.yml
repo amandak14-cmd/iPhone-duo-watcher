@@ -1,0 +1,51 @@
+name: iPhone Duo stock watcher
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "check = normal run · test = send a hello / find your chat id · discover = debug part numbers"
+        type: choice
+        options: [check, test, discover]
+        default: check
+
+concurrency:
+  group: stock-watcher
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Check Apple Store Singapore pickup stock
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          PART_NUMBERS: ${{ vars.PART_NUMBERS }}
+          MODE: ${{ github.event.inputs.mode || 'check' }}
+          RUN_MINUTES: ${{ (github.event.inputs.mode == 'test' || github.event.inputs.mode == 'discover') && '0' || '13' }}
+          INTERVAL_SECONDS: "30"
+        run: python watcher.py
+
+      - name: Save state
+        if: always()
+        run: |
+          if [ -f state.json ] && [ -n "$(git status --porcelain state.json)" ]; then
+            git config user.name  "stock-watcher"
+            git config user.email "stock-watcher@users.noreply.github.com"
+            git add state.json
+            git commit -m "Update stock state" -q
+            git pull --rebase -q && git push -q
+          fi
